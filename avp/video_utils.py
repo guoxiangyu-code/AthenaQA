@@ -888,7 +888,8 @@ def detect_scene_changes(
                 if token.startswith("pts_time:"):
                     try:
                         pts = float(token.split(":", 1)[1])
-                        # If we seeked with -ss the pts are relative; make absolute
+                        # -ss before -i → input seeking, pts is relative to
+                        # the seek point; convert back to absolute file time.
                         abs_ts = pts + (start_sec or 0.0)
                         timestamps.append(abs_ts)
                     except ValueError:
@@ -960,7 +961,9 @@ def compute_adaptive_timestamps(
         interval = duration / max_frames
         return [start_sec + i * interval for i in range(max_frames)]
 
-    # --- Step 1: divide into fine sub-intervals (0.5 s granularity) ---
+    # --- Step 1: divide into fine sub-intervals ---
+    # 0.5 s granularity balances resolution (captures ~1 s action bursts) with
+    # low bin overhead; for very short clips the bin count stays small.
     grain = 0.5
     n_bins = max(1, int(math.ceil(duration / grain)))
     bin_edges = [start_sec + i * grain for i in range(n_bins + 1)]
