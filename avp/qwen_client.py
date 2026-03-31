@@ -36,6 +36,8 @@ from .video_utils import (
     create_video_clip,
     create_reencoded_video_clip,
     round_intervals_full_seconds,
+    detect_scene_changes,
+    compute_adaptive_timestamps,
 )
 
 if TYPE_CHECKING:
@@ -123,6 +125,11 @@ class QwenClient:
         prefer_compressed: bool = True,
         keep_temp_clips: bool = False,
         qwen_video_mode: str = "video",
+        qwen_adaptive_frames: bool = False,
+        qwen_scene_threshold: float = 0.3,
+        qwen_keyframe_boost_factor: float = 3.0,
+        qwen_batch_observe: bool = False,
+        qwen_max_seconds_per_batch: int = 30,
     ):
         self.plan_replan_model = plan_replan_model if plan_replan_model is not None else model
         self.execute_model = execute_model if execute_model is not None else model
@@ -141,6 +148,11 @@ class QwenClient:
         self.created_clips: List[str] = []
         self.temp_clips_dir: Optional[str] = None
         self.qwen_video_mode = qwen_video_mode
+        self.qwen_adaptive_frames = qwen_adaptive_frames
+        self.qwen_scene_threshold = qwen_scene_threshold
+        self.qwen_keyframe_boost_factor = qwen_keyframe_boost_factor
+        self.qwen_batch_observe = qwen_batch_observe
+        self.qwen_max_seconds_per_batch = qwen_max_seconds_per_batch
         self._openai_client: Any = None
 
     # ------------------------------------------------------------------
@@ -264,6 +276,80 @@ class QwenClient:
         while t < end and len(timestamps) < max_frames:
             timestamps.append(t)
             t += interval
+
+        frames_b64: List[str] = []
+        for ts in timestamps:
+            frame_idx = int(ts * video_fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            if resize_short_edge:
+                h, w = frame.shape[:2]
+                if min(h, w) > resize_short_edge:
+                    scale = resize_short_edge / min(h, w)
+                    frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            frames_b64.append(base64.b64encode(buf).decode())
+        cap.release()
+        return frames_b64
+
+    def _extract_frames_adaptive(
+        self,
+        video_path: str,
+        fps: float,
+        start_sec: Optional[float] = None,
+        end_sec: Optional[float] = None,
+        max_frames: int = 128,
+        resize_short_edge: Optional[int] = None,
+    ) -> List[str]:
+        """Extract frames using scene-aware adaptive sampling.
+
+        Runs FFmpeg scene-change detection first, then allocates more frames
+        near high-activity moments while still covering the whole segment.
+        Falls back to uniform extraction if scene detection fails.
+        """
+        import cv2
+
+        cap = cv2.VideoCapture(video_path)
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / video_fps if video_fps > 0 else 0
+
+        start = start_sec if start_sec is not None else 0.0
+        end = end_sec if end_sec is not None else duration
+        if end <= start:
+            cap.release()
+            return []
+
+        # Run scene-change detection
+        scene_ts = detect_scene_changes(
+            video_path,
+            start_sec=start,
+            end_sec=end,
+            threshold=self.qwen_scene_threshold,
+            debug=self.debug,
+        )
+
+        # Compute adaptive timestamps
+        timestamps = compute_adaptive_timestamps(
+            start_sec=start,
+            end_sec=end,
+            base_fps=fps,
+            max_frames=max_frames,
+            scene_timestamps=scene_ts,
+            boost_factor=self.qwen_keyframe_boost_factor,
+            debug=self.debug,
+        )
+
+        if not timestamps:
+            # Fallback: uniform
+            interval = 1.0 / fps if fps > 0 else 1.0
+            t = start
+            timestamps = []
+            while t < end and len(timestamps) < max_frames:
+                timestamps.append(t)
+                t += interval
 
         frames_b64: List[str] = []
         for ts in timestamps:
@@ -423,7 +509,12 @@ class QwenClient:
         end_sec: Optional[float],
         media_resolution: Optional[str],
     ) -> List[Dict[str, Any]]:
-        """Extract frames and return as ``image_url`` blocks."""
+        """Extract frames and return as ``image_url`` blocks.
+
+        When ``qwen_adaptive_frames`` is enabled, uses scene-change-aware
+        sampling that concentrates frames around high-activity moments
+        (critical for sports / fast-paced video).
+        """
         effective_fps = fps or 1.0
         if media_resolution == "low":
             max_frames = self.max_frame_low
@@ -432,13 +523,22 @@ class QwenClient:
         else:
             max_frames = self.max_frame_medium
 
-        frames_b64 = self._extract_frames(
-            video_path,
-            effective_fps,
-            start_sec=start_sec,
-            end_sec=end_sec,
-            max_frames=max_frames,
-        )
+        if self.qwen_adaptive_frames:
+            frames_b64 = self._extract_frames_adaptive(
+                video_path,
+                effective_fps,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                max_frames=max_frames,
+            )
+        else:
+            frames_b64 = self._extract_frames(
+                video_path,
+                effective_fps,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                max_frames=max_frames,
+            )
         return [
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
             for b64 in frames_b64
@@ -453,6 +553,169 @@ class QwenClient:
         if hasattr(rate, "value"):
             return rate.value
         return str(rate).strip().lower()
+
+    # ------------------------------------------------------------------
+    # Batch observation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_regions_into_batches(
+        regions: List[Tuple[float, float]],
+        max_seconds: int,
+        duration_sec: float,
+    ) -> List[Tuple[float, float]]:
+        """Split regions into sub-batches of at most *max_seconds* each.
+
+        Each input region ``(start, end)`` is sliced into consecutive
+        sub-regions that are at most ``max_seconds`` long.  Regions are
+        clamped to ``[0, duration_sec]``.
+        """
+        batches: List[Tuple[float, float]] = []
+        for reg_start, reg_end in regions:
+            reg_start = max(0.0, float(reg_start))
+            reg_end = min(float(duration_sec), float(reg_end))
+            if reg_start >= reg_end:
+                continue
+            t = reg_start
+            while t < reg_end:
+                batch_end = min(t + max_seconds, reg_end)
+                batches.append((t, batch_end))
+                t = batch_end
+        return batches
+
+    def _infer_single_batch(
+        self,
+        video_path: str,
+        batch_start: float,
+        batch_end: float,
+        sub_query: str,
+        context: str,
+        duration_sec: float,
+        original_query: str,
+        batch_idx: int,
+        total_batches: int,
+        source_video_path: str = "",
+        resolved_video_path: str = "",
+        time_base: str = "",
+        temporal_hint_summary: str = "",
+    ) -> Tuple[List[Dict[str, Any]], str, str]:
+        """Run a single per-second-frame observation batch.
+
+        Extracts **one frame per second** for the segment
+        ``[batch_start, batch_end]``, sends them to the model with a
+        batch-aware prompt, and returns the parsed key-evidence list,
+        detailed response, and reasoning text.
+
+        Returns:
+            ``(key_evidence_list, detailed_response, reasoning)``
+        """
+        batch_duration = batch_end - batch_start
+        # 1 frame per second; at least 1 frame
+        batch_max_frames = max(1, int(batch_duration))
+        batch_fps = 1.0
+
+        frames_b64 = self._extract_frames(
+            video_path,
+            fps=batch_fps,
+            start_sec=batch_start,
+            end_sec=batch_end,
+            max_frames=batch_max_frames,
+        )
+
+        if self.debug:
+            print(
+                f"📸 Batch {batch_idx}/{total_batches}: "
+                f"[{batch_start:.1f}s–{batch_end:.1f}s] → {len(frames_b64)} frames at 1fps"
+            )
+
+        content_blocks: List[Dict[str, Any]] = [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+            for b64 in frames_b64
+        ]
+
+        # Build a batch-specific prompt using the existing inference template.
+        # Each batch is treated like a single-region observation.
+        media_inputs_for_prompt: List[Dict[str, Any]] = [{
+            "input_type": "batch_frames",
+            "source_video_path": source_video_path or video_path,
+            "resolved_video_path": resolved_video_path or video_path,
+            "absolute_start_sec": batch_start,
+            "absolute_end_sec": batch_end,
+            "clip_time_base": "raw_video_seconds",
+        }]
+        batch_note = (
+            f"[Batch {batch_idx} of {total_batches}] "
+            f"You are viewing 1 frame per second from {batch_start:.1f}s to {batch_end:.1f}s "
+            f"of the original video.  "
+            f"Frame N in this batch corresponds to second {batch_start:.0f}+N of the original video."
+        )
+        prompt = PromptManager.get_inference_prompt(
+            sub_query=sub_query,
+            context=context + f"\n\n{batch_note}" if context.strip() else batch_note,
+            start_sec=batch_start,
+            end_sec=batch_end,
+            original_query=original_query,
+            video_duration_sec=duration_sec,
+            is_region=True,
+            regions=[(batch_start, batch_end)],
+            media_inputs=media_inputs_for_prompt,
+            time_base=time_base or "raw_video_seconds",
+            temporal_hint_summary=temporal_hint_summary,
+        )
+
+        response_text = self._call_video_api(self.execute_model, prompt, content_blocks)
+        evidence_data = parse_json_response(response_text)
+
+        key_evidence: List[Dict[str, Any]] = []
+        detailed_response = ""
+        reasoning = ""
+
+        if evidence_data and validate_against_schema(evidence_data, EVIDENCE_SCHEMA):
+            detailed_response = evidence_data.get("detailed_response", "")
+            key_evidence = evidence_data.get("key_evidence", [])
+            reasoning = evidence_data.get("reasoning", "")
+        else:
+            detailed_response = self._extract_json_field(response_text, "detailed_response") or response_text
+            key_evidence = self._extract_key_evidence(response_text)
+            reasoning = self._extract_json_field(response_text, "reasoning") or ""
+
+        if self.debug:
+            print(f"   → {len(key_evidence)} evidence items from batch {batch_idx}")
+
+        return key_evidence, detailed_response, reasoning
+
+    @staticmethod
+    def _merge_batch_evidence(
+        batch_results: List[Tuple[List[Dict[str, Any]], str, str]],
+        batches: List[Tuple[float, float]],
+    ) -> Tuple[List[Dict[str, Any]], str, str]:
+        """Merge evidence from multiple batches into a single set.
+
+        * ``key_evidence`` items are concatenated (timestamps are already in
+          canonical raw-video seconds).
+        * ``detailed_response`` sections are joined with batch headers.
+        * ``reasoning`` sections are joined similarly.
+        """
+        all_key_evidence: List[Dict[str, Any]] = []
+        detailed_parts: List[str] = []
+        reasoning_parts: List[str] = []
+
+        for idx, ((kev, detail, reason), (b_start, b_end)) in enumerate(
+            zip(batch_results, batches), 1
+        ):
+            all_key_evidence.extend(kev)
+            if detail:
+                detailed_parts.append(
+                    f"[Batch {idx}, {b_start:.1f}s–{b_end:.1f}s] {detail}"
+                )
+            if reason:
+                reasoning_parts.append(
+                    f"[Batch {idx}, {b_start:.1f}s–{b_end:.1f}s] {reason}"
+                )
+
+        merged_detail = "\n\n".join(detailed_parts) if detailed_parts else ""
+        merged_reasoning = "\n\n".join(reasoning_parts) if reasoning_parts else ""
+        return all_key_evidence, merged_detail, merged_reasoning
 
     # ------------------------------------------------------------------
     # plan()
@@ -643,6 +906,135 @@ class QwenClient:
         parts: List[List[Dict[str, Any]]] = []
         clip_paths: List[str] = []
         frames_used: List[Dict[str, Any]] = []
+
+        # ---- BATCH PATH: per-second batch observation for region mode ----
+        if (
+            self.qwen_batch_observe
+            and watch_cfg.load_mode == "region"
+            and (watch_cfg.regions or (start_sec is not None and end_sec is not None))
+        ):
+            regions_to_batch = (
+                [(float(s), float(e)) for s, e in watch_cfg.regions]
+                if watch_cfg.regions
+                else [(float(start_sec), float(end_sec))]
+            )
+            batches = self._split_regions_into_batches(
+                regions_to_batch, self.qwen_max_seconds_per_batch, duration_sec,
+            )
+            if batches:
+                if self.debug:
+                    total_secs = sum(b[1] - b[0] for b in batches)
+                    print(
+                        f"🔄 Batch observation: {len(batches)} batches "
+                        f"(max {self.qwen_max_seconds_per_batch}s each, "
+                        f"{total_secs:.0f}s total, 1fps)"
+                    )
+
+                batch_results: List[Tuple[List[Dict[str, Any]], str, str]] = []
+                for b_idx, (b_start, b_end) in enumerate(batches, 1):
+                    kev, detail, reason = self._infer_single_batch(
+                        video_path=video_path,
+                        batch_start=b_start,
+                        batch_end=b_end,
+                        sub_query=sub_query,
+                        context=context,
+                        duration_sec=duration_sec,
+                        original_query=original_query,
+                        batch_idx=b_idx,
+                        total_batches=len(batches),
+                        source_video_path=source_input_path,
+                        resolved_video_path=resolved_input_path,
+                        time_base=time_base,
+                        temporal_hint_summary=temporal_hint_summary,
+                    )
+                    batch_results.append((kev, detail, reason))
+
+                    if store is not None:
+                        store.append_role_trace(
+                            f"observer_batch_{b_idx}", round_id,
+                            f"[batch {b_idx}/{len(batches)}]", detail[:500] if detail else "",
+                        )
+
+                key_evidence, merged_detail, merged_reasoning = self._merge_batch_evidence(
+                    batch_results, batches,
+                )
+
+                # Round to full seconds
+                try:
+                    raw_ranges: List[Tuple[float, float]] = []
+                    descs: List[str] = []
+                    for ev_item in key_evidence:
+                        if isinstance(ev_item, dict):
+                            ts_s = ev_item.get("timestamp_start")
+                            ts_e = ev_item.get("timestamp_end")
+                            desc = ev_item.get("description", "")
+                            if ts_s is not None and ts_e is not None:
+                                raw_ranges.append((float(ts_s), float(ts_e)))
+                                descs.append(str(desc))
+                    rounded = round_intervals_full_seconds(raw_ranges, duration=duration_sec)
+                    interval_to_desc: Dict[Tuple[int, int], str] = {}
+                    for _idx, (rs, re_) in enumerate(rounded):
+                        for jdx, (orig_s, orig_e) in enumerate(raw_ranges):
+                            if (floor(orig_s), ceil(orig_e)) == (rs, re_):
+                                cand = descs[jdx]
+                                if cand and not interval_to_desc.get((rs, re_)):
+                                    interval_to_desc[(rs, re_)] = cand
+                                    break
+                    key_evidence = [
+                        {"timestamp_start": int(rs), "timestamp_end": int(re_),
+                         "description": interval_to_desc.get((rs, re_), "")}
+                        for (rs, re_) in rounded
+                    ]
+                except Exception:
+                    pass
+
+                batch_frames_used = [
+                    {"start": b_s, "end": b_e, "fps": 1.0}
+                    for b_s, b_e in batches
+                ]
+                batch_media_inputs = [
+                    {
+                        "input_type": "batch_frames",
+                        "source_video_path": source_input_path,
+                        "resolved_video_path": resolved_input_path,
+                        "absolute_start_sec": b_s,
+                        "absolute_end_sec": b_e,
+                        "clip_time_base": "raw_video_seconds",
+                    }
+                    for b_s, b_e in batches
+                ]
+
+                model_call_metadata: Dict[str, Any] = {
+                    "model": self.execute_model,
+                    "fps": 1.0,
+                    "media_resolution": media_res,
+                    "prompt_version": "v2_structured_batch",
+                    "source_video_path": source_input_path,
+                    "resolved_video_path": resolved_input_path,
+                    "time_base": time_base or "raw_video_seconds",
+                    "media_inputs": batch_media_inputs,
+                    "batch_observe": True,
+                    "num_batches": len(batches),
+                    "max_seconds_per_batch": self.qwen_max_seconds_per_batch,
+                    "regions": batch_frames_used,
+                    "num_regions": len(batch_frames_used),
+                }
+
+                if self.debug:
+                    print(
+                        f"✅ Batch observation complete: "
+                        f"{len(key_evidence)} evidence items from {len(batches)} batches"
+                    )
+
+                return Evidence(
+                    detailed_response=merged_detail,
+                    key_evidence=key_evidence,
+                    reasoning=merged_reasoning,
+                    frames_used=batch_frames_used,
+                    model_call=model_call_metadata,
+                    timestamp=now_iso(),
+                    round_id=0,
+                )
 
         # ---- PATH A: region + multiple regions ----
         if watch_cfg.load_mode == "region" and watch_cfg.regions:
@@ -1202,6 +1594,11 @@ def create_client(cfg: Any) -> Any:
             prefer_compressed=cfg.prefer_compressed,
             keep_temp_clips=cfg.keep_temp_clips,
             qwen_video_mode=getattr(cfg, "qwen_video_mode", "video"),
+            qwen_adaptive_frames=getattr(cfg, "qwen_adaptive_frames", False),
+            qwen_scene_threshold=getattr(cfg, "qwen_scene_threshold", 0.3),
+            qwen_keyframe_boost_factor=getattr(cfg, "qwen_keyframe_boost_factor", 3.0),
+            qwen_batch_observe=getattr(cfg, "qwen_batch_observe", False),
+            qwen_max_seconds_per_batch=getattr(cfg, "qwen_max_seconds_per_batch", 30),
         )
     else:
         from .main import GeminiClient
