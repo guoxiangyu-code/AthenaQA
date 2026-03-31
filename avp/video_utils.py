@@ -821,6 +821,208 @@ def create_reencoded_video_clip(
         return None
 
 
+def detect_scene_changes(
+    video_path: str,
+    start_sec: Optional[float] = None,
+    end_sec: Optional[float] = None,
+    threshold: float = 0.3,
+    debug: bool = False,
+) -> List[float]:
+    """Detect scene-change timestamps in a video segment using FFmpeg.
+
+    Uses the ``select=gt(scene,threshold)`` filter to find frames where the
+    visual content changes significantly.  This is a fast pre-pass (no full
+    decode) that produces a list of *absolute* timestamps (seconds from the
+    start of the video file).
+
+    Args:
+        video_path: Path to the video file.
+        start_sec: Optional start of the segment to analyse (seconds).
+        end_sec: Optional end of the segment to analyse (seconds).
+        threshold: Scene-change sensitivity in [0, 1].  Lower values detect
+            more changes.  0.3 is a reasonable default; use 0.15-0.2 for
+            fast-paced sports videos.
+        debug: Print diagnostic messages.
+
+    Returns:
+        Sorted list of scene-change timestamps (seconds, absolute).
+        Returns an empty list if FFmpeg is unavailable or fails.
+    """
+    if not check_ffmpeg_available():
+        if debug:
+            print("⚠️  ffmpeg not available, cannot detect scene changes")
+        return []
+
+    cmd: List[str] = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+    ]
+
+    if start_sec is not None and start_sec > 0:
+        cmd += ["-ss", str(start_sec)]
+    if end_sec is not None and end_sec > 0:
+        cmd += ["-to", str(end_sec)]
+
+    cmd += [
+        "-i", video_path,
+        "-vf", f"select='gt(scene,{threshold})',showinfo",
+        "-vsync", "vfr",
+        "-f", "null",
+        "-",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        # showinfo prints to stderr; each line contains "pts_time:<float>"
+        timestamps: List[float] = []
+        for line in result.stderr.splitlines():
+            if "pts_time:" not in line:
+                continue
+            for token in line.split():
+                if token.startswith("pts_time:"):
+                    try:
+                        pts = float(token.split(":", 1)[1])
+                        # If we seeked with -ss the pts are relative; make absolute
+                        abs_ts = pts + (start_sec or 0.0)
+                        timestamps.append(abs_ts)
+                    except ValueError:
+                        continue
+        timestamps.sort()
+        if debug:
+            print(
+                f"🎬 Scene detection: found {len(timestamps)} change(s) "
+                f"in [{start_sec or 0:.1f}s, {end_sec or '?'}s] "
+                f"(threshold={threshold})"
+            )
+        return timestamps
+    except subprocess.TimeoutExpired:
+        if debug:
+            print("⚠️  Scene detection timed out")
+        return []
+    except Exception as exc:
+        if debug:
+            print(f"⚠️  Scene detection failed: {exc}")
+        return []
+
+
+def compute_adaptive_timestamps(
+    start_sec: float,
+    end_sec: float,
+    base_fps: float,
+    max_frames: int,
+    scene_timestamps: List[float],
+    boost_factor: float = 3.0,
+    boost_window: float = 2.0,
+    debug: bool = False,
+) -> List[float]:
+    """Generate frame timestamps that concentrate around scene changes.
+
+    The algorithm works in two passes:
+
+    1. **Importance scoring** – divide the time range into fine-grained
+       sub-intervals.  Each sub-interval gets a base importance of 1.0; if a
+       scene change falls inside or within ``boost_window`` seconds, the
+       importance is multiplied by ``boost_factor``.
+    2. **Proportional allocation** – distribute ``max_frames`` across the
+       sub-intervals proportionally to their importance, then generate
+       uniformly-spaced timestamps within each sub-interval.
+
+    This ensures that high-activity moments (e.g. a basketball shot, a goal)
+    get more frames while still covering the rest of the clip.
+
+    Args:
+        start_sec: Clip start (absolute seconds).
+        end_sec: Clip end (absolute seconds).
+        base_fps: Baseline FPS (used as a ceiling when no scene changes exist).
+        max_frames: Hard cap on the number of frames to produce.
+        scene_timestamps: Sorted list of scene-change timestamps (absolute).
+        boost_factor: How much to multiply the sampling density near scene
+            changes (default 3×).
+        boost_window: Seconds before/after a scene change that receive the
+            boosted density (default 2 s).
+        debug: Print diagnostics.
+
+    Returns:
+        Sorted list of frame timestamps (absolute seconds).
+    """
+    duration = end_sec - start_sec
+    if duration <= 0 or max_frames <= 0:
+        return []
+
+    # Fast path: no scene changes → uniform
+    if not scene_timestamps:
+        interval = duration / max_frames
+        return [start_sec + i * interval for i in range(max_frames)]
+
+    # --- Step 1: divide into fine sub-intervals (0.5 s granularity) ---
+    grain = 0.5
+    n_bins = max(1, int(math.ceil(duration / grain)))
+    bin_edges = [start_sec + i * grain for i in range(n_bins + 1)]
+    # Ensure the last edge is exactly end_sec
+    bin_edges[-1] = end_sec
+
+    # --- Step 2: score each bin ---
+    scores: List[float] = []
+    for i in range(n_bins):
+        lo = bin_edges[i]
+        hi = bin_edges[i + 1]
+        mid = (lo + hi) / 2.0
+        importance = 1.0
+        for sc_ts in scene_timestamps:
+            if abs(sc_ts - mid) <= boost_window:
+                importance = boost_factor
+                break
+        scores.append(importance)
+
+    total_score = sum(scores)
+    if total_score <= 0:
+        total_score = 1.0
+
+    # --- Step 3: allocate frames proportionally ---
+    # Use floating-point allocation then round with largest-remainder method
+    raw_alloc = [(s / total_score) * max_frames for s in scores]
+    int_alloc = [int(a) for a in raw_alloc]
+    remainders = [(raw_alloc[i] - int_alloc[i], i) for i in range(n_bins)]
+    remainders.sort(reverse=True)
+    deficit = max_frames - sum(int_alloc)
+    for j in range(min(deficit, n_bins)):
+        int_alloc[remainders[j][1]] += 1
+
+    # --- Step 4: generate timestamps ---
+    timestamps: List[float] = []
+    for i in range(n_bins):
+        n_frames_bin = int_alloc[i]
+        if n_frames_bin <= 0:
+            continue
+        lo = bin_edges[i]
+        hi = bin_edges[i + 1]
+        bin_dur = hi - lo
+        if n_frames_bin == 1:
+            timestamps.append((lo + hi) / 2.0)
+        else:
+            step = bin_dur / n_frames_bin
+            for j in range(n_frames_bin):
+                timestamps.append(lo + j * step)
+
+    timestamps.sort()
+    # Clamp to [start_sec, end_sec)
+    timestamps = [t for t in timestamps if start_sec <= t < end_sec]
+
+    if debug:
+        boosted_bins = sum(1 for s in scores if s > 1.0)
+        print(
+            f"🎯 Adaptive sampling: {len(timestamps)} frames from {n_bins} bins "
+            f"({boosted_bins} boosted), {len(scene_timestamps)} scene changes"
+        )
+    return timestamps
+
+
 def cleanup_video_clips(video_path: str = None, clip_paths: List[str] = None, debug: bool = True) -> None:
     """Clean up specific video clips that were created.
     

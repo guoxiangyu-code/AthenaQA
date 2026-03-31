@@ -36,6 +36,8 @@ from .video_utils import (
     create_video_clip,
     create_reencoded_video_clip,
     round_intervals_full_seconds,
+    detect_scene_changes,
+    compute_adaptive_timestamps,
 )
 
 if TYPE_CHECKING:
@@ -123,6 +125,9 @@ class QwenClient:
         prefer_compressed: bool = True,
         keep_temp_clips: bool = False,
         qwen_video_mode: str = "video",
+        qwen_adaptive_frames: bool = False,
+        qwen_scene_threshold: float = 0.3,
+        qwen_keyframe_boost_factor: float = 3.0,
     ):
         self.plan_replan_model = plan_replan_model if plan_replan_model is not None else model
         self.execute_model = execute_model if execute_model is not None else model
@@ -141,6 +146,9 @@ class QwenClient:
         self.created_clips: List[str] = []
         self.temp_clips_dir: Optional[str] = None
         self.qwen_video_mode = qwen_video_mode
+        self.qwen_adaptive_frames = qwen_adaptive_frames
+        self.qwen_scene_threshold = qwen_scene_threshold
+        self.qwen_keyframe_boost_factor = qwen_keyframe_boost_factor
         self._openai_client: Any = None
 
     # ------------------------------------------------------------------
@@ -264,6 +272,80 @@ class QwenClient:
         while t < end and len(timestamps) < max_frames:
             timestamps.append(t)
             t += interval
+
+        frames_b64: List[str] = []
+        for ts in timestamps:
+            frame_idx = int(ts * video_fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            if resize_short_edge:
+                h, w = frame.shape[:2]
+                if min(h, w) > resize_short_edge:
+                    scale = resize_short_edge / min(h, w)
+                    frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            frames_b64.append(base64.b64encode(buf).decode())
+        cap.release()
+        return frames_b64
+
+    def _extract_frames_adaptive(
+        self,
+        video_path: str,
+        fps: float,
+        start_sec: Optional[float] = None,
+        end_sec: Optional[float] = None,
+        max_frames: int = 128,
+        resize_short_edge: Optional[int] = None,
+    ) -> List[str]:
+        """Extract frames using scene-aware adaptive sampling.
+
+        Runs FFmpeg scene-change detection first, then allocates more frames
+        near high-activity moments while still covering the whole segment.
+        Falls back to uniform extraction if scene detection fails.
+        """
+        import cv2
+
+        cap = cv2.VideoCapture(video_path)
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / video_fps if video_fps > 0 else 0
+
+        start = start_sec if start_sec is not None else 0.0
+        end = end_sec if end_sec is not None else duration
+        if end <= start:
+            cap.release()
+            return []
+
+        # Run scene-change detection
+        scene_ts = detect_scene_changes(
+            video_path,
+            start_sec=start,
+            end_sec=end,
+            threshold=self.qwen_scene_threshold,
+            debug=self.debug,
+        )
+
+        # Compute adaptive timestamps
+        timestamps = compute_adaptive_timestamps(
+            start_sec=start,
+            end_sec=end,
+            base_fps=fps,
+            max_frames=max_frames,
+            scene_timestamps=scene_ts,
+            boost_factor=self.qwen_keyframe_boost_factor,
+            debug=self.debug,
+        )
+
+        if not timestamps:
+            # Fallback: uniform
+            interval = 1.0 / fps if fps > 0 else 1.0
+            t = start
+            timestamps = []
+            while t < end and len(timestamps) < max_frames:
+                timestamps.append(t)
+                t += interval
 
         frames_b64: List[str] = []
         for ts in timestamps:
@@ -423,7 +505,12 @@ class QwenClient:
         end_sec: Optional[float],
         media_resolution: Optional[str],
     ) -> List[Dict[str, Any]]:
-        """Extract frames and return as ``image_url`` blocks."""
+        """Extract frames and return as ``image_url`` blocks.
+
+        When ``qwen_adaptive_frames`` is enabled, uses scene-change-aware
+        sampling that concentrates frames around high-activity moments
+        (critical for sports / fast-paced video).
+        """
         effective_fps = fps or 1.0
         if media_resolution == "low":
             max_frames = self.max_frame_low
@@ -432,13 +519,22 @@ class QwenClient:
         else:
             max_frames = self.max_frame_medium
 
-        frames_b64 = self._extract_frames(
-            video_path,
-            effective_fps,
-            start_sec=start_sec,
-            end_sec=end_sec,
-            max_frames=max_frames,
-        )
+        if self.qwen_adaptive_frames:
+            frames_b64 = self._extract_frames_adaptive(
+                video_path,
+                effective_fps,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                max_frames=max_frames,
+            )
+        else:
+            frames_b64 = self._extract_frames(
+                video_path,
+                effective_fps,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                max_frames=max_frames,
+            )
         return [
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
             for b64 in frames_b64
@@ -1202,6 +1298,9 @@ def create_client(cfg: Any) -> Any:
             prefer_compressed=cfg.prefer_compressed,
             keep_temp_clips=cfg.keep_temp_clips,
             qwen_video_mode=getattr(cfg, "qwen_video_mode", "video"),
+            qwen_adaptive_frames=getattr(cfg, "qwen_adaptive_frames", False),
+            qwen_scene_threshold=getattr(cfg, "qwen_scene_threshold", 0.3),
+            qwen_keyframe_boost_factor=getattr(cfg, "qwen_keyframe_boost_factor", 3.0),
         )
     else:
         from .main import GeminiClient

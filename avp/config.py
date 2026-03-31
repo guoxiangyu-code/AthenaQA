@@ -59,6 +59,9 @@ class AVPConfig:
     qwen_plan_model: str = ""  # empty → fallback to qwen_model
     qwen_execute_model: str = ""  # empty → fallback to qwen_model
     qwen_video_mode: str = "video"  # "video" | "frames" | "auto"
+    qwen_adaptive_frames: bool = False  # Enable scene-aware adaptive frame extraction
+    qwen_scene_threshold: float = 0.3  # Scene change detection sensitivity (0-1, lower = more sensitive)
+    qwen_keyframe_boost_factor: float = 3.0  # FPS multiplier near scene changes
 
     def __post_init__(self):
         """Initialize location as list if it's a string."""
