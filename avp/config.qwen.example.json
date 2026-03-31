@@ -9,6 +9,8 @@
     "qwen_adaptive_frames": false,
     "qwen_scene_threshold": 0.3,
     "qwen_keyframe_boost_factor": 3.0,
+    "qwen_batch_observe": false,
+    "qwen_max_seconds_per_batch": 30,
     "debug": true,
     "max_frame_low": 240,
     "max_frame_medium": 128,
